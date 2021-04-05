@@ -260,6 +260,7 @@ export default function StatsCollector(
     // Updates stats interval
     this.audioLevelsIntervalMilis = audioLevelsInterval;
 
+    this.speakerList = [];
     this.statsIntervalId = null;
     this.statsIntervalMilis = statsInterval;
 
@@ -270,7 +271,15 @@ export default function StatsCollector(
     this.ssrc2stats = new Map();
 }
 
-/* eslint-enable max-params */
+/**
+ * Set the list of the remote speakers for which audio levels are to be calculated.
+ *
+ * @param {Array<string>} speakerList - Endpoint ids.
+ * @returns {void}
+ */
+StatsCollector.prototype.setSpeakerList = function(speakerList) {
+    this.speakerList = speakerList;
+};
 
 /**
  * Stops stats updates.
@@ -308,7 +317,7 @@ StatsCollector.prototype.start = function(startAudioLevelStats) {
         this.audioLevelsIntervalId = setInterval(
             () => {
                 if (browser.supportsReceiverStats()) {
-                    const audioLevels = this.peerconnection.getAudioLevels();
+                    const audioLevels = this.peerconnection.getAudioLevels(this.speakerList);
 
                     for (const ssrc in audioLevels) {
                         if (audioLevels.hasOwnProperty(ssrc)) {
@@ -354,41 +363,41 @@ StatsCollector.prototype.start = function(startAudioLevelStats) {
         );
     }
 
-    this.statsIntervalId = setInterval(
-        () => {
-            // Interval updates
-            this.peerconnection.getStats(
-                report => {
-                    let results = null;
+    const processStats = () => {
+        // Interval updates
+        this.peerconnection.getStats(
+            report => {
+                let results = null;
 
-                    if (!report || !report.result
-                        || typeof report.result !== 'function') {
-                        // firefox
-                        results = report;
+                if (!report || !report.result
+                    || typeof report.result !== 'function') {
+                    // firefox
+                    results = report;
+                } else {
+                    // chrome
+                    results = report.result();
+                }
+
+                this.currentStatsReport = results;
+                try {
+                    if (this._usesPromiseGetStats) {
+                        this.processNewStatsReport();
                     } else {
-                        // chrome
-                        results = report.result();
+                        this.processStatsReport();
                     }
+                } catch (e) {
+                    GlobalOnErrorHandler.callErrorHandler(e);
+                    logger.error(`Unsupported key:${e}`, e);
+                }
 
-                    this.currentStatsReport = results;
-                    try {
-                        if (this._usesPromiseGetStats) {
-                            this.processNewStatsReport();
-                        } else {
-                            this.processStatsReport();
-                        }
-                    } catch (e) {
-                        GlobalOnErrorHandler.callErrorHandler(e);
-                        logger.error(`Unsupported key:${e}`, e);
-                    }
+                this.previousStatsReport = this.currentStatsReport;
+            },
+            error => this.errorCallback(error)
+        );
+    };
 
-                    this.previousStatsReport = this.currentStatsReport;
-                },
-                error => this.errorCallback(error)
-            );
-        },
-        this.statsIntervalMilis
-    );
+    processStats();
+    this.statsIntervalId = setInterval(processStats, this.statsIntervalMilis);
 };
 
 /**

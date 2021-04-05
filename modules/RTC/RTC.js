@@ -455,7 +455,7 @@ export default class RTC extends Listenable {
      * @return {TraceablePeerConnection}
      */
     createPeerConnection(signaling, iceConfig, isP2P, options) {
-        const pcConstraints = RTC.getPCConstraints(isP2P);
+        const pcConstraints = JSON.parse(JSON.stringify(RTCUtils.pcConstraints));
 
         if (typeof options.abtestSuspendVideo !== 'undefined') {
             RTCUtils.setSuspendVideo(pcConstraints, options.abtestSuspendVideo);
@@ -646,43 +646,6 @@ export default class RTC extends Listenable {
         }
 
         this.localTracks.splice(pos, 1);
-    }
-
-    /**
-     * Removes all JitsiRemoteTracks associated with given MUC nickname
-     * (resource part of the JID). Returns array of removed tracks.
-     *
-     * @param {string} Owner The resource part of the MUC JID.
-     * @returns {JitsiRemoteTrack[]}
-     */
-    removeRemoteTracks(owner) {
-        let removedTracks = [];
-
-        for (const tpc of this.peerConnections.values()) {
-            const pcRemovedTracks = tpc.removeRemoteTracks(owner);
-
-            removedTracks = removedTracks.concat(pcRemovedTracks);
-        }
-
-        logger.debug(
-            `Removed remote tracks for ${owner}`
-                + ` count: ${removedTracks.length}`);
-
-        return removedTracks;
-    }
-
-    /**
-     *
-     */
-    static getPCConstraints(isP2P) {
-        const pcConstraints
-            = isP2P ? RTCUtils.p2pPcConstraints : RTCUtils.pcConstraints;
-
-        if (!pcConstraints) {
-            return {};
-        }
-
-        return JSON.parse(JSON.stringify(pcConstraints));
     }
 
     /**
@@ -882,8 +845,6 @@ export default class RTC extends Listenable {
         track.setAudioLevel(audioLevel, tpc);
     }
 
-    /* eslint-enable max-params */
-
     /**
      * Sends message via the bridge channel.
      * @param {string} to The id of the endpoint that should receive the
@@ -897,6 +858,17 @@ export default class RTC extends Listenable {
             this._channel.sendMessage(to, payload);
         } else {
             throw new Error('Channel support is disabled!');
+        }
+    }
+
+    /**
+     * Sends the local stats via the bridge channel.
+     * @param {Object} payload The payload of the message.
+     * @throws NetworkError/InvalidStateError/Error if the operation fails or if there is no data channel created.
+     */
+    sendEndpointStatsMessage(payload) {
+        if (this._channel && this._channel.isOpen()) {
+            this._channel.sendEndpointStatsMessage(payload);
         }
     }
 

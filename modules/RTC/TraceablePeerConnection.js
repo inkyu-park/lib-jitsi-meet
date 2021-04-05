@@ -469,6 +469,32 @@ TraceablePeerConnection.prototype._getDesiredMediaDirection = function(
 };
 
 /**
+ * Returns the list of RTCRtpReceivers created for the source of the given media type associated with
+ * the set of remote endpoints specified.
+ * @param {Array<string>} endpoints list of the endpoints
+ * @param {string} mediaType 'audio' or 'video'
+ * @returns {Array<RTCRtpReceiver>} list of receivers created by the peerconnection.
+ */
+TraceablePeerConnection.prototype._getReceiversByEndpointIds = function(endpoints, mediaType) {
+    let remoteTracks = [];
+    let receivers = [];
+
+    for (const endpoint of endpoints) {
+        remoteTracks = remoteTracks.concat(this.getRemoteTracks(endpoint, mediaType));
+    }
+
+    // Get the ids of the MediaStreamTracks associated with each of these remote tracks.
+    const remoteTrackIds = remoteTracks.map(remote => remote.track?.id);
+
+    receivers = this.peerconnection.getReceivers()
+        .filter(receiver => receiver.track
+            && receiver.track.kind === mediaType
+            && remoteTrackIds.find(trackId => trackId === receiver.track.id));
+
+    return receivers;
+};
+
+/**
  * Tells whether or not this TPC instance is using Simulcast.
  * @return {boolean} <tt>true</tt> if simulcast is enabled and active or
  * <tt>false</tt> if it's turned off.
@@ -526,16 +552,17 @@ TraceablePeerConnection.prototype._peerMutedChanged = function(
 };
 
 /**
- * Obtains audio levels of the remote audio tracks by getting the source
- * information on the RTCRtpReceivers. The information relevant to the ssrc
- * is updated each time a RTP packet constaining the ssrc is received.
- * @returns {Object} containing ssrc and audio level information as a
- * key-value pair.
+ * Obtains audio levels of the remote audio tracks by getting the source information on the RTCRtpReceivers.
+ * The information relevant to the ssrc is updated each time a RTP packet constaining the ssrc is received.
+ * @param {Array<string>} speakerList list of endpoint ids for which audio levels are to be gathered.
+ * @returns {Object} containing ssrc and audio level information as a key-value pair.
  */
-TraceablePeerConnection.prototype.getAudioLevels = function() {
+TraceablePeerConnection.prototype.getAudioLevels = function(speakerList = []) {
     const audioLevels = {};
-    const audioReceivers = this.peerconnection.getReceivers()
-        .filter(receiver => receiver.track && receiver.track.kind === MediaType.AUDIO);
+    const audioReceivers = speakerList.length
+        ? this._getReceiversByEndpointIds(speakerList, MediaType.AUDIO)
+        : this.peerconnection.getReceivers()
+            .filter(receiver => receiver.track && receiver.track.kind === MediaType.AUDIO && receiver.track.enabled);
 
     audioReceivers.forEach(remote => {
         const ssrc = remote.getSynchronizationSources();
@@ -628,6 +655,50 @@ TraceablePeerConnection.prototype.getRemoteTracks = function(
     }
 
     return remoteTracks;
+};
+
+/**
+ * Parses the remote description and returns the sdp lines of the sources associated with a remote participant.
+ *
+ * @param {string} id Endpoint id of the remote participant.
+ * @returns {Array<string>} The sdp lines that have the ssrc information.
+ */
+TraceablePeerConnection.prototype.getRemoteSourceInfoByParticipant = function(id) {
+    const removeSsrcInfo = [];
+    const remoteTracks = this.getRemoteTracks(id);
+
+    if (!remoteTracks?.length) {
+        return removeSsrcInfo;
+    }
+    const primarySsrcs = remoteTracks.map(track => track.getSSRC());
+    const sdp = new SDP(this.remoteDescription.sdp);
+
+    primarySsrcs.forEach((ssrc, idx) => {
+        for (const media of sdp.media) {
+            let lines = '';
+            let ssrcLines = SDPUtil.findLines(media, `a=ssrc:${ssrc}`);
+
+            if (ssrcLines.length) {
+                if (!removeSsrcInfo[idx]) {
+                    removeSsrcInfo[idx] = '';
+                }
+
+                // Check if there are any FID groups present for the primary ssrc.
+                const fidLines = SDPUtil.findLines(media, `a=ssrc-group:FID ${ssrc}`);
+
+                if (fidLines.length) {
+                    const secondarySsrc = fidLines[0].split(' ')[2];
+
+                    lines += `${fidLines[0]}\r\n`;
+                    ssrcLines = ssrcLines.concat(SDPUtil.findLines(media, `a=ssrc:${secondarySsrc}`));
+                }
+                removeSsrcInfo[idx] += `${ssrcLines.join('\r\n')}\r\n`;
+                removeSsrcInfo[idx] += lines;
+            }
+        }
+    });
+
+    return removeSsrcInfo;
 };
 
 /**
@@ -1529,34 +1600,42 @@ TraceablePeerConnection.prototype._mungeCodecOrder = function(description) {
     }
 
     const parsedSdp = transform.parse(description.sdp);
-    const mLine = parsedSdp.media.find(m => m.type === this.codecPreference.mediaType);
 
-    if (this.codecPreference.enable) {
-        SDPUtil.preferCodec(mLine, this.codecPreference.mimeType);
+    for (const mLine of parsedSdp.media) {
+        if (this.codecPreference.enable && mLine.type === this.codecPreference.mediaType) {
+            SDPUtil.preferCodec(mLine, this.codecPreference.mimeType);
 
-        // Strip the high profile H264 codecs on mobile clients for p2p connection.
-        // High profile codecs give better quality at the expense of higher load which
-        // we do not want on mobile clients.
-        // Jicofo offers only the baseline code for the jvb connection.
-        // TODO - add check for mobile browsers once js-utils provides that check.
-        if (this.codecPreference.mimeType === CodecMimeType.H264 && browser.isReactNative() && this.isP2P) {
-            SDPUtil.stripCodec(mLine, this.codecPreference.mimeType, true /* high profile */);
+            // Strip the high profile H264 codecs on mobile clients for p2p connection.
+            // High profile codecs give better quality at the expense of higher load which
+            // we do not want on mobile clients.
+            // Jicofo offers only the baseline code for the jvb connection.
+            // TODO - add check for mobile browsers once js-utils provides that check.
+            if (this.codecPreference.mimeType === CodecMimeType.H264 && browser.isReactNative() && this.isP2P) {
+                SDPUtil.stripCodec(mLine, this.codecPreference.mimeType, true /* high profile */);
+            }
+
+            // Set the max bitrate here on the SDP so that the configured max. bitrate is effective
+            // as soon as the browser switches to VP9.
+            if (this.codecPreference.mimeType === CodecMimeType.VP9) {
+                const bitrates = this.videoBitrates.VP9 || this.videoBitrates;
+                const hdBitrate = bitrates.high ? bitrates.high : HD_BITRATE;
+
+                // Use only the HD bitrate for now as there is no API available yet for configuring
+                // the bitrates on the individual SVC layers.
+                mLine.bandwidth = [ {
+                    type: 'AS',
+                    limit: this._isSharingScreen() ? HD_BITRATE : Math.floor(hdBitrate / 1000)
+                } ];
+            } else {
+                // Clear the bandwidth limit in SDP when VP9 is no longer the preferred codec.
+                // This is needed on react native clients as react-native-webrtc returns the
+                // SDP that the application passed instead of returning the SDP off the native side.
+                // This line automatically gets cleared on web on every renegotiation.
+                mLine.bandwidth = undefined;
+            }
+        } else if (mLine.type === this.codecPreference.mediaType) {
+            SDPUtil.stripCodec(mLine, this.codecPreference.mimeType);
         }
-
-        // Set the max bitrate here on the SDP so that the configured max. bitrate is effective
-        // as soon as the browser switches to VP9.
-        if (this.codecPreference.mimeType === CodecMimeType.VP9) {
-            const bitrates = Object.values(this.videoBitrates.VP9 || this.videoBitrates);
-
-            // Use only the HD bitrate for now as there is no API available yet for configuring
-            // the bitrates on the individual SVC layers.
-            mLine.bandwidth = [ {
-                type: 'AS',
-                limit: this._isSharingScreen() ? HD_BITRATE : Math.floor(bitrates[2] / 1000)
-            } ];
-        }
-    } else {
-        SDPUtil.stripCodec(mLine, this.codecPreference.mimeType);
     }
 
     return new RTCSessionDescription({
@@ -1791,8 +1870,29 @@ TraceablePeerConnection.prototype.setVideoCodecs = function(preferredCodec = nul
     }
 
     if (browser.supportsCodecPreferences()) {
-        // TODO implement codec preference using RTCRtpTransceiver.setCodecPreferences()
-        // We are using SDP munging for now until all browsers support this.
+        const transceiver = this.peerconnection.getTransceivers()
+            .find(t => t.receiver && t.receiver?.track?.kind === MediaType.VIDEO);
+
+        if (!transceiver) {
+            return;
+        }
+        let capabilities = RTCRtpReceiver.getCapabilities('video').codecs;
+
+        if (enable) {
+            // Move the desired codec (all variations of it as well) to the beginning of the list.
+            /* eslint-disable-next-line arrow-body-style */
+            capabilities.sort(caps => {
+                return caps.mimeType.toLowerCase() === `video/${mimeType}` ? -1 : 1;
+            });
+        } else {
+            capabilities = capabilities.filter(caps => caps.mimeType.toLowerCase() !== `video/${mimeType}`);
+        }
+
+        try {
+            transceiver.setCodecPreferences(capabilities);
+        } catch (err) {
+            logger.warn(`Setting ${mimeType} as ${enable ? 'preferred' : 'disabled'} codec failed`, err);
+        }
     }
 };
 
@@ -1878,11 +1978,15 @@ TraceablePeerConnection.prototype.findSenderForTrack = function(track) {
  */
 TraceablePeerConnection.prototype.replaceTrack = function(oldTrack, newTrack) {
     if (browser.usesUnifiedPlan()) {
+        logger.debug('TPC.replaceTrack using unified plan.');
+
         return this.tpcUtils.replaceTrack(oldTrack, newTrack)
 
             // renegotiate when SDP is used for simulcast munging
             .then(() => this.isSimulcastOn() && browser.usesSdpMungingForSimulcast());
     }
+
+    logger.debug('TPC.replaceTrack using plan B.');
 
     let promiseChain = Promise.resolve();
 
@@ -2124,20 +2228,18 @@ TraceablePeerConnection.prototype.setSenderVideoDegradationPreference = function
         return Promise.resolve();
     }
     const parameters = videoSender.getParameters();
+    const preference = localVideoTrack.videoType === VideoType.CAMERA
+        ? DEGRADATION_PREFERENCE_CAMERA
+        : this.options.capScreenshareBitrate && browser.usesPlanB()
 
-    if (!parameters.encodings || !parameters.encodings.length) {
-        return Promise.resolve();
-    }
-    for (const encoding in parameters.encodings) {
-        if (parameters.encodings.hasOwnProperty(encoding)) {
-            const preference = localVideoTrack.videoType === VideoType.CAMERA
-                ? DEGRADATION_PREFERENCE_CAMERA
-                : DEGRADATION_PREFERENCE_DESKTOP;
+            // Prefer resolution for low fps share.
+            ? DEGRADATION_PREFERENCE_DESKTOP
 
-            logger.info(`Setting video sender degradation preference on ${this} to ${preference}`);
-            parameters.encodings[encoding].degradationPreference = preference;
-        }
-    }
+            // Prefer frame-rate for high fps share.
+            : DEGRADATION_PREFERENCE_CAMERA;
+
+    logger.info(`Setting a degradation preference of ${preference} on local video track`);
+    parameters.degradationPreference = preference;
     this.tpcUtils.updateEncodingsResolution(parameters);
 
     return videoSender.setParameters(parameters);

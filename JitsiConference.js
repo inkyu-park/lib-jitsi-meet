@@ -1127,7 +1127,8 @@ JitsiConference.prototype.replaceTrack = function(oldTrack, newTrack) {
             }
 
             return Promise.resolve();
-        }, error => Promise.reject(new Error(error)));
+        })
+        .catch(error => Promise.reject(new Error(error)));
 };
 
 /**
@@ -1470,16 +1471,35 @@ JitsiConference.prototype.grantOwner = function(id) {
 };
 
 /**
+ * Revoke owner rights to the participant or local Participant as
+ * the user might want to refuse to be a moderator.
+ * @param {string} id id of the participant to revoke owner rights to.
+ */
+JitsiConference.prototype.revokeOwner = function(id) {
+    const participant = this.getParticipantById(id);
+    const isMyself = this.myUserId() === id;
+    const role = this.isMembersOnly() ? 'member' : 'none';
+
+    if (isMyself) {
+        this.room.setAffiliation(this.room.myroomjid, role);
+    } else if (participant) {
+        this.room.setAffiliation(participant.getJid(), role);
+    }
+};
+
+
+/**
  * Kick participant from this conference.
  * @param {string} id id of the participant to kick
+ * @param {string} reason reason of the participant to kick
  */
-JitsiConference.prototype.kickParticipant = function(id) {
+JitsiConference.prototype.kickParticipant = function(id, reason) {
     const participant = this.getParticipantById(id);
 
     if (!participant) {
         return;
     }
-    this.room.kick(participant.getJid());
+    this.room.kick(participant.getJid(), reason);
 };
 
 /**
@@ -1667,20 +1687,36 @@ JitsiConference.prototype.onMemberLeft = function(jid) {
 
     delete this.participants[id];
 
-    const removedTracks = this.rtc.removeRemoteTracks(id);
+    // Remove the ssrcs from the remote description.
+    const mediaSessions = this._getMediaSessions();
+    const removePromises = [];
 
-    removedTracks.forEach(
-        track =>
-            this.eventEmitter.emit(JitsiConferenceEvents.TRACK_REMOVED, track));
-
-    // there can be no participant in case the member that left is focus
-    if (participant) {
-        this.eventEmitter.emit(
-            JitsiConferenceEvents.USER_LEFT, id, participant);
+    for (const session of mediaSessions) {
+        removePromises.push(session.removeRemoteStreamsOnLeave(id));
     }
 
-    this._maybeStartOrStopP2P(true /* triggered by user left event */);
-    this._maybeClearSITimeout();
+    Promise.allSettled(removePromises)
+        .then(results => {
+            let removedTracks = [];
+
+            results.map(result => result.value).forEach(value => {
+                if (value) {
+                    removedTracks = removedTracks.concat(value);
+                }
+            });
+
+            removedTracks.forEach(track => {
+                this.eventEmitter.emit(JitsiConferenceEvents.TRACK_REMOVED, track);
+            });
+
+            // There can be no participant in case the member that left is focus.
+            if (participant) {
+                this.eventEmitter.emit(JitsiConferenceEvents.USER_LEFT, id, participant);
+            }
+
+            this._maybeStartOrStopP2P(true /* triggered by user left event */);
+            this._maybeClearSITimeout();
+        });
 };
 
 /**
@@ -1691,8 +1727,9 @@ JitsiConference.prototype.onMemberLeft = function(jid) {
  * of the kick.
  * @param {string?} kickedParticipantId - when it is not a kick for local participant,
  * this is the id of the participant which was kicked.
+ * @param {string} reason - reason of the participant to kick
  */
-JitsiConference.prototype.onMemberKicked = function(isSelfPresence, actorId, kickedParticipantId) {
+JitsiConference.prototype.onMemberKicked = function(isSelfPresence, actorId, kickedParticipantId, reason) {
     // This check which be true when we kick someone else. With the introduction of lobby
     // the ChatRoom KICKED event is now also emitted for ourselves (the kicker) so we want to
     // avoid emitting an event where `undefined` kicked someone.
@@ -1704,7 +1741,7 @@ JitsiConference.prototype.onMemberKicked = function(isSelfPresence, actorId, kic
 
     if (isSelfPresence) {
         this.eventEmitter.emit(
-            JitsiConferenceEvents.KICKED, actorParticipant);
+            JitsiConferenceEvents.KICKED, actorParticipant, reason);
 
         this.leave();
 
@@ -1714,7 +1751,7 @@ JitsiConference.prototype.onMemberKicked = function(isSelfPresence, actorId, kic
     const kickedParticipant = this.participants[kickedParticipantId];
 
     this.eventEmitter.emit(
-        JitsiConferenceEvents.PARTICIPANT_KICKED, actorParticipant, kickedParticipant);
+        JitsiConferenceEvents.PARTICIPANT_KICKED, actorParticipant, kickedParticipant, reason);
 };
 
 /**
@@ -1984,7 +2021,7 @@ JitsiConference.prototype._acceptJvbIncomingCall = function(
     try {
         jingleSession.initialize(this.room, this.rtc, {
             ...this.options.config,
-            enableInsertableStreams: this._isE2EEEnabled()
+            enableInsertableStreams: this.isE2EEEnabled()
         });
     } catch (error) {
         GlobalOnErrorHandler.callErrorHandler(error);
@@ -2562,6 +2599,15 @@ JitsiConference.prototype.sendEndpointMessage = function(to, payload) {
 };
 
 /**
+ * Sends local stats via the bridge channel which then forwards to other endpoints selectively.
+ * @param {Object} payload The payload of the message.
+ * @throws NetworkError/InvalidStateError/Error if the operation fails or if there is no data channel created.
+ */
+JitsiConference.prototype.sendEndpointStatsMessage = function(payload) {
+    this.rtc.sendEndpointStatsMessage(payload);
+};
+
+/**
  * Sends a broadcast message via the data channel.
  * @param payload {object} the payload of the message.
  * @throws NetworkError or InvalidStateError or Error if the operation fails.
@@ -2737,7 +2783,7 @@ JitsiConference.prototype._acceptP2PIncomingCall = function(
         this.room,
         this.rtc, {
             ...this.options.config,
-            enableInsertableStreams: this._isE2EEEnabled()
+            enableInsertableStreams: this.isE2EEEnabled()
         });
 
     logger.info('Starting CallStats for P2P connection...');
@@ -3097,7 +3143,7 @@ JitsiConference.prototype._startP2PSession = function(remoteJid) {
         this.room,
         this.rtc, {
             ...this.options.config,
-            enableInsertableStreams: this._isE2EEEnabled()
+            enableInsertableStreams: this.isE2EEEnabled()
         });
 
     logger.info('Starting CallStats for P2P connection...');
@@ -3369,6 +3415,27 @@ JitsiConference.prototype.getSpeakerStats = function() {
 };
 
 /**
+ * Sets the constraints for the video that is requested from the bridge.
+ *
+ * @param {Object} videoConstraints The constraints which are specified in the
+ * following format. The message updates the fields that are present and leaves the
+ * rest unchanged on the bridge. Therefore, any field that is not applicable anymore
+ * should be cleared by passing an empty object or list (whatever is applicable).
+ * {
+ *      'lastN': 20,
+ *      'selectedEndpoints': ['A', 'B', 'C'],
+ *      'onStageEndpoints': ['A'],
+ *      'defaultConstraints': { 'maxHeight': 180 },
+ *      'constraints': {
+ *          'A': { 'maxHeight': 720 }
+ *      }
+ * }
+ */
+JitsiConference.prototype.setReceiverConstraints = function(videoConstraints) {
+    this.receiveVideoController.setReceiverConstraints(videoConstraints);
+};
+
+/**
  * Sets the maximum video size the local participant should receive from remote
  * participants.
  *
@@ -3486,7 +3553,7 @@ JitsiConference.prototype._restartMediaSessions = function() {
  *
  * @returns {boolean}
  */
-JitsiConference.prototype._isE2EEEnabled = function() {
+JitsiConference.prototype.isE2EEEnabled = function() {
     return this._e2eEncryption && this._e2eEncryption.isEnabled();
 };
 
