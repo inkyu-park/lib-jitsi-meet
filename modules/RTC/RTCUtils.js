@@ -62,7 +62,12 @@ const DEFAULT_CONSTRAINTS = {
         height: {
             ideal: 720,
             max: 720,
-            min: 240
+            min: 180
+        },
+        width: {
+            ideal: 1280,
+            max: 1280,
+            min: 320
         }
     }
 };
@@ -70,7 +75,7 @@ const DEFAULT_CONSTRAINTS = {
 /**
  * The default frame rate for Screen Sharing.
  */
-const SS_DEFAULT_FRAME_RATE = 30;
+export const SS_DEFAULT_FRAME_RATE = 5;
 
 // Currently audio output device change is supported only in Chrome and
 // default output always has 'default' device ID
@@ -92,6 +97,9 @@ let disableAGC = false;
 
 // Disables Highpass Filter
 let disableHPF = false;
+
+// Enables stereo.
+let stereo = null;
 
 const featureDetectionAudioEl = document.createElement('audio');
 const isAudioOutputDeviceChangeAvailable
@@ -411,35 +419,15 @@ function newGetConstraints(um = [], options = {}) {
             constraints.audio = {};
         }
 
-        // Use the standard audio constraints on non-chromium browsers.
-        if (browser.isFirefox() || browser.isWebKitBased()) {
-            constraints.audio = {
-                deviceId: options.micDeviceId,
-                autoGainControl: !disableAGC && !disableAP,
-                echoCancellation: !disableAEC && !disableAP,
-                noiseSuppression: !disableNS && !disableAP
-            };
-        } else {
-            // NOTE(brian): the new-style ('advanced' instead of 'optional')
-            // doesn't seem to carry through the googXXX constraints
-            // Changing back to 'optional' here (even with video using
-            // the 'advanced' style) allows them to be passed through
-            // but also requires the device id to capture to be set in optional
-            // as sourceId otherwise the constraints are considered malformed.
-            if (!constraints.audio.optional) {
-                constraints.audio.optional = [];
-            }
-            constraints.audio.optional.push(
-                { sourceId: options.micDeviceId },
-                { echoCancellation: !disableAEC && !disableAP },
-                { googEchoCancellation: !disableAEC && !disableAP },
-                { googAutoGainControl: !disableAGC && !disableAP },
-                { googNoiseSuppression: !disableNS && !disableAP },
-                { googHighpassFilter: !disableHPF && !disableAP },
-                { googNoiseSuppression2: !disableNS && !disableAP },
-                { googEchoCancellation2: !disableAEC && !disableAP },
-                { googAutoGainControl2: !disableAGC && !disableAP }
-            );
+        constraints.audio = {
+            autoGainControl: !disableAGC && !disableAP,
+            deviceId: options.micDeviceId,
+            echoCancellation: !disableAEC && !disableAP,
+            noiseSuppression: !disableNS && !disableAP
+        };
+
+        if (stereo) {
+            Object.assign(constraints.audio, { channelCount: 2 });
         }
     } else {
         constraints.audio = false;
@@ -497,28 +485,6 @@ function getSSConstraints(options = {}) {
 
     if (typeof desktopStream !== 'undefined') {
         constraints.chromeMediaSourceId = desktopStream;
-    }
-
-    return constraints;
-}
-
-/**
- * Generates constraints for screen sharing when using getDisplayMedia.
- * The constraints(MediaTrackConstraints) are applied to the resulting track.
- *
- * @returns {Object} - MediaTrackConstraints constraints.
- */
-function getTrackSSConstraints(options = {}) {
-    // we used to set height and width in the constraints, but this can lead
-    // to inconsistencies if the browser is on a lower resolution screen
-    // and we share a screen with bigger resolution, so they are now not set
-    const constraints = {
-        frameRate: SS_DEFAULT_FRAME_RATE
-    };
-    const { desktopSharingFrameRate } = options;
-
-    if (desktopSharingFrameRate && desktopSharingFrameRate.max) {
-        constraints.frameRate = desktopSharingFrameRate.max;
     }
 
     return constraints;
@@ -775,6 +741,10 @@ class RTCUtils extends Listenable {
         if (typeof options.disableHPF === 'boolean') {
             disableHPF = options.disableHPF;
             logger.info(`Disable HPF: ${disableHPF}`);
+        }
+        if (typeof options.audioQuality?.stereo === 'boolean') {
+            stereo = options.audioQuality.stereo;
+            logger.info(`Stereo: ${stereo}`);
         }
 
         window.clearInterval(availableDevicesPollTimer);
@@ -1133,8 +1103,7 @@ class RTCUtils extends Listenable {
             desktopSharingSources: options.desktopSharingSources,
             gumOptions: {
                 frameRate: options.desktopSharingFrameRate
-            },
-            trackOptions: getTrackSSConstraints(options)
+            }
         };
     }
 
@@ -1212,8 +1181,7 @@ class RTCUtils extends Listenable {
 
                 // Leverage the helper used by {@link _newGetDesktopMedia} to
                 // get constraints for the desktop stream.
-                const { gumOptions, trackOptions }
-                    = this._parseDesktopSharingOptions(otherOptions);
+                const { gumOptions } = this._parseDesktopSharingOptions(otherOptions);
 
                 const constraints = {
                     video: {
@@ -1224,19 +1192,10 @@ class RTCUtils extends Listenable {
 
                 return this._getUserMedia(requestedDevices, constraints, timeout)
                     .then(stream => {
-                        const track = stream && stream.getTracks()[0];
-                        const applyConstrainsPromise
-                            = track && track.applyConstraints
-                                ? track.applyConstraints(trackOptions)
-                                : Promise.resolve();
-
-                        return applyConstrainsPromise
-                            .then(() => {
-                                return {
-                                    sourceType: 'device',
-                                    stream
-                                };
-                            });
+                        return {
+                            sourceType: 'device',
+                            stream
+                        };
                     });
             }
 
